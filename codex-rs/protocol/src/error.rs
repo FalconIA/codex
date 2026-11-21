@@ -819,16 +819,31 @@ fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
     }
 }
 
-#[derive(Debug)]
 pub struct RetryLimitReachedError {
     pub status: StatusCode,
     pub request_id: Option<String>,
+    /// Full raw response body captured only by the opt-in generic HTTP 429 mode.
+    /// This deliberately stays out of `Debug` output to avoid accidental log exposure.
+    pub body: Option<String>,
 }
 
-impl std::fmt::Display for RetryLimitReachedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for RetryLimitReachedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetryLimitReachedError")
+            .field("status", &self.status)
+            .field("request_id", &self.request_id)
+            .finish()
+    }
+}
+
+impl fmt::Display for RetryLimitReachedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(body) = self.body.as_deref().filter(|body| !body.trim().is_empty()) {
+            return formatter.write_str(body);
+        }
         write!(
-            f,
+            formatter,
             "exceeded retry limit, last status: {}{}",
             self.status,
             self.request_id

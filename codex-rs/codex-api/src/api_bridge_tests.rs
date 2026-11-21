@@ -163,6 +163,231 @@ async fn http_retry_deadline_survives_mapping_and_respects_terminal_errors() {
     }
 }
 
+fn map_http_429_with_options(
+    body: Option<String>,
+    headers: Option<HeaderMap>,
+    retry_after: Option<RetryAfter>,
+    options: ApiErrorMappingOptions,
+) -> CodexErr {
+    map_api_error_with_options(
+        ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::TOO_MANY_REQUESTS,
+            url: None,
+            headers,
+            body,
+            retry_after,
+        }),
+        options,
+    )
+}
+
+#[test]
+fn http_429_full_body_switch_requires_an_exact_enabling_value() {
+    for (value, expected) in [
+        (None, false),
+        (Some("1"), true),
+        (Some("true"), true),
+        (Some(""), false),
+        (Some("0"), false),
+        (Some("false"), false),
+        (Some("yes"), false),
+        (Some("true "), false),
+    ] {
+        assert_eq!(parse_http_429_full_body_flag(value), expected, "{value:?}");
+    }
+}
+
+#[test]
+fn generic_http_429_default_uses_summary_not_error_message_or_extra_fields() {
+    let body = serde_json::json!({
+        "error": {
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+            "message": "provider message that must not become the display summary",
+            "extra": {"diagnostic": "extra field that must not leak by default"}
+        }
+    })
+    .to_string();
+    let err = map_http_429_with_options(Some(body), None, None, ApiErrorMappingOptions::default());
+
+    let CodexErrorDetails::RetryLimit(details) = err.details() else {
+        panic!("expected CodexErrorDetails::RetryLimit, got {err:?}");
+    };
+    assert_eq!(details.body, None);
+    assert_eq!(details.status, http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(details.request_id, None);
+    assert_eq!(
+        err.to_string(),
+        "exceeded retry limit, last status: 429 Too Many Requests"
+    );
+    assert_eq!(
+        err.to_codex_protocol_error(),
+        CodexErrorInfo::ResponseTooManyFailedAttempts {
+            http_status_code: Some(429),
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn generic_http_429_opt_in_preserves_long_unicode_json_and_metadata() {
+    use std::time::Duration;
+
+    let body = serde_json::json!({
+        "error": {
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+            "message": "限流",
+            "diagnostic": "限流诊断".repeat(200),
+            "extra": {"request_context": "完整保留"}
+        }
+    })
+    .to_string();
+    assert!(body.len() > 1000);
+    let retry_after = RetryAfter::from_delay(Duration::from_secs(17)).expect("retry deadline");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        REQUEST_ID_HEADER,
+        http::HeaderValue::from_static("request-429"),
+    );
+    let err = map_http_429_with_options(
+        Some(body.clone()),
+        Some(headers),
+        Some(retry_after),
+        ApiErrorMappingOptions {
+            http_429_full_body: true,
+        },
+    );
+
+    let CodexErrorDetails::RetryLimit(details) = err.details() else {
+        panic!("expected CodexErrorDetails::RetryLimit, got {err:?}");
+    };
+    assert_eq!(details.body.as_deref(), Some(body.as_str()));
+    assert_eq!(details.status, http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(details.request_id.as_deref(), Some("request-429"));
+    assert_eq!(err.to_string(), body);
+    assert_eq!(err.retry_after(), Some(retry_after));
+    assert_eq!(
+        err.retry_delay(/*retry_count*/ 1),
+        Some(Duration::from_secs(17))
+    );
+    assert_eq!(err.http_status_code_value(), Some(429));
+    assert_eq!(
+        err.to_codex_protocol_error(),
+        CodexErrorInfo::ResponseTooManyFailedAttempts {
+            http_status_code: Some(429),
+        }
+    );
+}
+
+#[test]
+fn generic_http_429_opt_in_preserves_plain_text_body() {
+    let body = "rate limited: 请稍后重试\nretry later".to_string();
+    let err = map_http_429_with_options(
+        Some(body.clone()),
+        None,
+        None,
+        ApiErrorMappingOptions {
+            http_429_full_body: true,
+        },
+    );
+
+    let CodexErrorDetails::RetryLimit(details) = err.details() else {
+        panic!("expected CodexErrorDetails::RetryLimit, got {err:?}");
+    };
+    assert_eq!(details.body.as_deref(), Some(body.as_str()));
+    assert_eq!(err.to_string(), body);
+}
+
+#[test]
+fn generic_http_429_opt_in_empty_body_uses_existing_summary() {
+    for body in [None, Some(String::new())] {
+        let retained_body = body.clone().unwrap_or_default();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REQUEST_ID_HEADER,
+            http::HeaderValue::from_static("request-429"),
+        );
+        let err = map_http_429_with_options(
+            body,
+            Some(headers),
+            None,
+            ApiErrorMappingOptions {
+                http_429_full_body: true,
+            },
+        );
+
+        let CodexErrorDetails::RetryLimit(details) = err.details() else {
+            panic!("expected CodexErrorDetails::RetryLimit, got {err:?}");
+        };
+        assert_eq!(details.body.as_deref(), Some(retained_body.as_str()));
+        assert_eq!(details.request_id.as_deref(), Some("request-429"));
+        assert_eq!(
+            err.to_string(),
+            "exceeded retry limit, last status: 429 Too Many Requests, request id: request-429"
+        );
+    }
+}
+
+#[test]
+fn generic_http_429_opt_in_does_not_capture_typed_429_errors() {
+    let options = ApiErrorMappingOptions {
+        http_429_full_body: true,
+    };
+
+    let usage_body = serde_json::json!({
+        "error": {
+            "type": "usage_limit_reached",
+            "plan_type": "pro",
+            "diagnostic": "typed usage detail"
+        }
+    })
+    .to_string();
+    let usage_err = map_http_429_with_options(Some(usage_body), None, None, options);
+    assert!(matches!(
+        usage_err.details(),
+        CodexErrorDetails::UsageLimitReached(_)
+    ));
+    assert_eq!(
+        usage_err.to_codex_protocol_error(),
+        CodexErrorInfo::UsageLimitExceeded
+    );
+
+    let quota_body = serde_json::json!({
+        "error": {
+            "type": "insufficient_quota",
+            "code": "insufficient_quota",
+            "diagnostic": "typed quota detail"
+        }
+    })
+    .to_string();
+    let quota_err = map_http_429_with_options(Some(quota_body), None, None, options);
+    assert!(matches!(
+        quota_err.details(),
+        CodexErrorDetails::QuotaExceeded
+    ));
+    assert_eq!(
+        quota_err.to_codex_protocol_error(),
+        CodexErrorInfo::UsageLimitExceeded
+    );
+
+    let flex_body = serde_json::json!({
+        "error": {
+            "code": "flex_unavailable",
+            "message": "typed policy or capacity detail"
+        }
+    })
+    .to_string();
+    let flex_err = map_http_429_with_options(Some(flex_body), None, None, options);
+    assert!(matches!(
+        flex_err.details(),
+        CodexErrorDetails::FlexUnavailable
+    ));
+    assert_eq!(
+        flex_err.to_codex_protocol_error(),
+        CodexErrorInfo::FlexUnavailable
+    );
+}
+
 #[test]
 fn map_http_error_classifies_provider_codes() {
     use CodexErrorInfo::ModelNotFound;

@@ -49,6 +49,7 @@ fn retryability_preserves_error_details_distinctions() {
             CodexErr::RetryLimit(RetryLimitReachedError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 request_id: None,
+                body: None,
             }),
             false,
         ),
@@ -77,6 +78,33 @@ fn retryability_preserves_error_details_distinctions() {
             err.retry_delay(/*retry_count*/ 1).is_some(),
             expected,
             "unexpected retryability for {err:?}"
+        );
+    }
+}
+
+#[test]
+fn retry_limit_reached_error_displays_opt_in_raw_body_or_summary() {
+    let sentinel = "retry_body_sentinel_7e2c1a";
+    let body = format!("{{\"error\":{{\"message\":\"限流 {sentinel}\"}}}}\nsecond line");
+    let error = RetryLimitReachedError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        request_id: Some("request-429".to_string()),
+        body: Some(body.to_string()),
+    };
+    assert_eq!(error.to_string(), body);
+    assert!(!format!("{error:?}").contains(sentinel));
+    let error = CodexErr::RetryLimit(error);
+    assert!(!format!("{error:?}").contains(sentinel));
+
+    for body in [None, Some(String::new()), Some("  \n".to_string())] {
+        let error = RetryLimitReachedError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            request_id: Some("request-429".to_string()),
+            body,
+        };
+        assert_eq!(
+            error.to_string(),
+            "exceeded retry limit, last status: 429 Too Many Requests, request id: request-429"
         );
     }
 }

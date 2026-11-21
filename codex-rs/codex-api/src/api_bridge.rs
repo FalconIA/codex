@@ -20,7 +20,31 @@ use http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+const HTTP_429_FULL_BODY_ENV: &str = "CODEX_HTTP_429_FULL_BODY";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ApiErrorMappingOptions {
+    http_429_full_body: bool,
+}
+
+impl ApiErrorMappingOptions {
+    fn from_env() -> Self {
+        let value = std::env::var(HTTP_429_FULL_BODY_ENV).ok();
+        Self {
+            http_429_full_body: parse_http_429_full_body_flag(value.as_deref()),
+        }
+    }
+}
+
+fn parse_http_429_full_body_flag(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true"))
+}
+
 pub fn map_api_error(err: ApiError) -> CodexErr {
+    map_api_error_with_options(err, ApiErrorMappingOptions::from_env())
+}
+
+fn map_api_error_with_options(err: ApiError, options: ApiErrorMappingOptions) -> CodexErr {
     let retry_after = match &err {
         ApiError::Retryable { retry_after, .. }
         | ApiError::RateLimitExceeded { retry_after, .. }
@@ -50,14 +74,14 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         | ApiError::BioPolicy { .. }
         | ApiError::MisalignmentPolicyViolation { .. } => None,
     };
-    let error = map_api_error_details(err);
+    let error = map_api_error_details(err, options);
     match retry_after {
         Some(retry_after) => error.with_retry_after(retry_after),
         None => error,
     }
 }
 
-fn map_api_error_details(err: ApiError) -> CodexErr {
+fn map_api_error_details(err: ApiError, options: ApiErrorMappingOptions) -> CodexErr {
     match err {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
@@ -139,7 +163,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                 let parsed_body = serde_json::from_str::<Value>(&body_text).ok();
                 let provider_error = parsed_body.as_ref().and_then(|body| body.get("error"));
                 if let Some(error) = parse_terminal_provider_error(provider_error, Some(status)) {
-                    return map_api_error_details(error);
+                    return map_api_error_details(error, options);
                 }
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
@@ -276,6 +300,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                     CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: extract_request_tracking_id(headers.as_ref()),
+                        body: options.http_429_full_body.then_some(body_text),
                     })
                 } else {
                     let response = UnexpectedResponseError {
@@ -315,6 +340,7 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
             TransportError::RetryLimit => CodexErr::RetryLimit(RetryLimitReachedError {
                 status: http::StatusCode::INTERNAL_SERVER_ERROR,
                 request_id: None,
+                body: None,
             }),
             TransportError::Timeout => CodexErr::RequestTimeout,
             TransportError::Policy(denied) => CodexErr::Fatal(denied.to_string()),
