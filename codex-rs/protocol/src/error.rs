@@ -1,3 +1,5 @@
+// Modified by FalconIA for opt-in full HTTP 429 response bodies.
+
 use crate::ThreadId;
 use crate::auth::KnownPlan;
 use crate::auth::PlanType;

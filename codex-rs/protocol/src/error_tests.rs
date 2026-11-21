@@ -1,3 +1,5 @@
+// Modified by FalconIA for opt-in full HTTP 429 response bodies.
+
 use super::*;
 use crate::exec_output::StreamOutput;
 use crate::protocol::RateLimitWindow;

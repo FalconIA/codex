@@ -1,3 +1,5 @@
+// Modified by FalconIA for opt-in full HTTP 429 response bodies.
+
 use crate::TransportError;
 use crate::error::ApiError;
 use crate::error::parse_terminal_provider_error;
